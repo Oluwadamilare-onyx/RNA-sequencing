@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# -------------------------
+# CONFIG
+# -------------------------
+THREADS=8
+OUTDIR=rnaseq_project
+mkdir -p $OUTDIR/{raw_fastq,qc,trimmed,star_index,alignments,counts,logs}
+
+# SRR IDs (vasculature samples)
+CONTROL=("SRR12808527" "SRR12808528" "SRR12808529")
+TREATED=("SRR12808497" "SRR12808498" "SRR12808499")
+
+# Reference (TAIR10 / Ensembl Plants). Adjust release as needed.
+GENOME_FA=$OUTDIR/reference/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa.gz
+GTF=$OUTDIR/reference/Arabidopsis_thaliana.TAIR10.49.gtf.gz
+
+mkdir -p $OUTDIR/reference
+
+# -------------------------
+# 1. Download reference genome & annotation (Ensembl Plants / TAIR)
+# (If you already have these, skip download and point to your files)
+# -------------------------
+echo "[INFO] Downloading reference genome and GTF..."
+# Example Ensembl Plants FTP urls (adjust release number if necessary)
+wget -c -O $GENOME_FA "ftp://ftp.ensemblgenomes.org/pub/plants/release-49/fasta/arabidopsis_thaliana/dna/Arabidopsis_thaliana.TAIR10.dna.toplevel.fa.gz"
+wget -c -O $GTF "ftp://ftp.ensemblgenomes.org/pub/plants/release-49/gtf/arabidopsis_thaliana/Arabidopsis_thaliana.TAIR10.49.gtf.gz"
+
+# Unzip for STAR index building
+gunzip -c $GENOME_FA > $OUTDIR/reference/Arabidopsis_thaliana.TAIR10.fa
+gunzip -c $GTF > $OUTDIR/reference/Arabidopsis_thaliana.TAIR10.gtf
+
+# -------------------------
+# 2. Build STAR index
+# -------------------------
+echo "[INFO] Building STAR index..."
+mkdir -p $OUTDIR/star_index
+STAR --runThreadN $THREADS \
+     --runMode genomeGenerate \
+     --genomeDir $OUTDIR/star_index \
+     --genomeFastaFiles $OUTDIR/reference/Arabidopsis_thaliana.TAIR10.fa \
+     --sjdbGTFfile $OUTDIR/reference/Arabidopsis_thaliana.TAIR10.gtf \
+     --sjdbOverhang 99 \
+     --limitGenomeGenerateRAM 31000000000
+
+# -------------------------
+# 3. Download FASTQ data from ENA / SRA
+# -------------------------
+echo "[INFO] Downloading FASTQ files (SRA IDs)..."
+# Use fasterq-dump (SRA Toolkit) or prefetch + fasterq-dump. Here we assume fasterq-dump is installed.
+for id in "${CONTROL[@]}" "${TREATED[@]}"; do
+  echo "[INFO] Getting $id"
+  # fasterq-dump writes uncompressed fastq by default; we gzip to save space
+  fasterq-dump --split-files --threads $THREADS $id -O $OUTDIR/raw_fastq
+  gzip -c $OUTDIR/raw_fastq/${id}_1.fastq > $OUTDIR/raw_fastq/${id}_1.fastq.gz
+  gzip -c $OUTDIR/raw_fastq/${id}_2.fastq > $OUTDIR/raw_fastq/${id}_2.fastq.gz
+  rm $OUTDIR/raw_fastq/${id}_*_*.fastq || true
+done
+
+# -------------------------
+# 4. FastQC and MultiQC
+# -------------------------
+echo "[INFO] Running FastQC..."
+mkdir -p $OUTDIR/qc/fastqc
+fastqc -t $THREADS -o $OUTDIR/qc/fastqc $OUTDIR/raw_fastq/*.fastq.gz
+
+echo "[INFO] Running MultiQC..."
+multiqc -o $OUTDIR/qc $OUTDIR/qc/fastqc
+
+# -------------------------
+# 5. (Optional) Trimming with fastp
+# -------------------------
+echo "[INFO] Trimming reads with fastp..."
+mkdir -p $OUTDIR/trimmed
+for id in "${CONTROL[@]}" "${TREATED[@]}"; do
+  fastp -w $THREADS \
+        -i $OUTDIR/raw_fastq/${id}_1.fastq.gz \
+        -I $OUTDIR/raw_fastq/${id}_2.fastq.gz \
+        -o $OUTDIR/trimmed/${id}_1.trim.fastq.gz \
+        -O $OUTDIR/trimmed/${id}_2.trim.fastq.gz \
+        --detect_adapter_for_pe \
+        --qualified_quality_phred 15 \
+        --length_required 25 \
+        --html $OUTDIR/qc/${id}_fastp.html \
+        --json $OUTDIR/qc/${id}_fastp.json
+done
+
+# Re-run FastQC on trimmed reads
+fastqc -t $THREADS -o $OUTDIR/qc/fastqc $OUTDIR/trimmed/*.fastq.gz
+multiqc -o $OUTDIR/qc $OUTDIR/qc/fastqc $OUTDIR/qc
+
+# -------------------------
+# 6. STAR alignment
+# -------------------------
+echo "[INFO] Aligning reads with STAR..."
+mkdir -p $OUTDIR/alignments
+for id in "${CONTROL[@]}" "${TREATED[@]}"; do
+  STAR --runThreadN $THREADS \
+       --genomeDir $OUTDIR/star_index \
+       --readFilesIn $OUTDIR/trimmed/${id}_1.trim.fastq.gz $OUTDIR/trimmed/${id}_2.trim.fastq.gz \
+       --readFilesCommand zcat \
+       --outFileNamePrefix $OUTDIR/alignments/${id}. \
+       --outSAMtype BAM Unsorted \
+       --quantMode TranscriptomeSAM GeneCounts \
+       --outSAMattributes NH HI AS nM MD
+  # Move STAR output BAM to a predictable name
+  mv $OUTDIR/alignments/${id}.Aligned.out.bam $OUTDIR/alignments/${id}.Aligned.out.bam
+done
+
+# -------------------------
+# 7. Samtools: sort & index
+# -------------------------
+echo "[INFO] Sorting and indexing BAMs..."
+for id in "${CONTROL[@]}" "${TREATED[@]}"; do
+  samtools sort -@ $THREADS -o $OUTDIR/alignments/${id}.Aligned.sortedByCoord.out.bam $OUTDIR/alignments/${id}.Aligned.out.bam
+  samtools index $OUTDIR/alignments/${id}.Aligned.sortedByCoord.out.bam
+done
+
+# -------------------------
+# 8. FeatureCounts (generate gene-level counts)
+# -------------------------
+echo "[INFO] Running featureCounts..."
+BAMS=""
+for id in "${CONTROL[@]}" "${TREATED[@]}"; do
+  BAMS="$BAMS $OUTDIR/alignments/${id}.Aligned.sortedByCoord.out.bam"
+done
+
+featureCounts -T $THREADS -p -B -C \
+  -a $OUTDIR/reference/Arabidopsis_thaliana.TAIR10.gtf \
+  -o $OUTDIR/counts/featureCounts.txt $BAMS
+
+# Create a clean counts matrix (remove first column annotation rows)
+# featureCounts writes a header with comments — we'll create a simple gene x sample matrix
+Rscript -e "d <- read.delim('$OUTDIR/counts/featureCounts.txt',comment.char='#',check.names=FALSE); \
+            write.csv(d[,c(1,7:ncol(d))],file='$OUTDIR/counts/count_matrix_raw.csv',row.names=FALSE)"
+
+echo "[INFO] Pipeline finished. Counts are at $OUTDIR/counts/count_matrix_raw.csv"

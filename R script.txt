@@ -1,0 +1,157 @@
+#!/usr/bin/env Rscript
+
+# ================================
+# DESeq2 analysis + enrichment
+# ================================
+suppressMessages({
+  library(DESeq2)
+  library(tibble)
+  library(dplyr)
+  library(readr)
+  library(org.At.tair.db)        # Bioconductor org package for Arabidopsis (if available)
+  library(clusterProfiler)
+  library(enrichplot)
+  library(ggplot2)
+  library(gprofiler2)           # alternative for pathway enrichment (g:Profiler)
+})
+
+outdir <- "rnaseq_project/results"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# ---------------------------
+# 1. Read counts (featureCounts output converted to CSV)
+# ---------------------------
+counts_raw <- read_csv("rnaseq_project/counts/count_matrix_raw.csv")
+# Inspect first columns (featureCounts keeps columns: Geneid, Chr, Start, ... then samples)
+# We assume the first column is 'Geneid' and samples start at column 7 (featureCounts default).
+# If your CSV is different, adjust accordingly.
+
+# Detect sample columns (numeric)
+# For safety, try to find columns that are numeric after first column
+sample_cols <- which(sapply(counts_raw, is.numeric))
+if(length(sample_cols) < 3) {
+  stop("Could not detect numeric count columns automatically. Check count CSV structure.")
+}
+
+counts <- counts_raw[, sample_cols]
+rownames(counts) <- counts_raw[[1]]  # gene IDs
+
+# ---------------------------
+# 2. Construct sample table (condition)
+# ---------------------------
+sample_ids <- colnames(counts)
+# Replace sample IDs to match SRR order if necessary. Here we explicitly define:
+control_ids <- c("SRR12808527","SRR12808528","SRR12808529")
+treated_ids <- c("SRR12808497","SRR12808498","SRR12808499")
+
+# Ensure column names match these IDs; if featureCounts appended path, try to trim
+# Trim possible path prefixes:
+sample_ids_short <- sub("^.*/","", sample_ids)
+colnames(counts) <- sample_ids_short
+sample_ids_short
+
+# Prepare metadata
+coldata <- data.frame(
+  sample = sample_ids_short,
+  condition = ifelse(sample_ids_short %in% control_ids, "Control",
+                     ifelse(sample_ids_short %in% treated_ids, "UV", NA))
+)
+rownames(coldata) <- coldata$sample
+
+if(any(is.na(coldata$condition))) {
+  warning("Some samples have unknown condition. Please edit 'control_ids' and 'treated_ids' to match column names.")
+}
+
+# ---------------------------
+# 3. DESeq2 analysis
+# ---------------------------
+dds <- DESeqDataSetFromMatrix(countData = round(as.matrix(counts)),
+                              colData = coldata,
+                              design = ~ condition)
+# keep genes with some counts
+dds <- dds[rowSums(counts(dds)) >= 10, ]
+
+dds <- DESeq(dds, parallel=TRUE)  # uses BiocParallel if available
+
+res <- results(dds, contrast = c("condition", "UV", "Control"))
+res <- lfcShrink(dds, coef="condition_UV_vs_Control", res=res, type="apeglm")
+
+# Order by padj
+res_ordered <- as.data.frame(res[order(res$padj), ])
+res_ordered$gene_id <- rownames(res_ordered)
+
+# Write full DE table
+write_csv(res_ordered, file.path(outdir, "DESeq2_results_full.csv"))
+
+# ---------------------------
+# 4. Top 100 DE genes (by padj then abs(log2FC))
+# ---------------------------
+top100 <- res_ordered %>%
+  filter(!is.na(padj)) %>%
+  arrange(padj, desc(abs(log2FoldChange))) %>%
+  slice(1:100)
+
+write_csv(top100, file.path(outdir, "top100_DE_genes.csv"))
+
+# Print top 10 to screen
+print(head(top100, 10))
+
+# ---------------------------
+# 5. MA plot, PCA, Volcano
+# ---------------------------
+png(file.path(outdir, "PCA_plot.png"), width=800, height=600)
+rld <- rlog(dds, blind=FALSE)
+plotPCA(rld, intgroup="condition")
+dev.off()
+
+png(file.path(outdir, "MA_plot.png"), width=800, height=600)
+plotMA(res, main="DESeq2", ylim=c(-5,5))
+dev.off()
+
+# Volcano plot
+res_df <- as.data.frame(res)
+res_df$gene <- rownames(res_df)
+res_df$padj[is.na(res_df$padj)] <- 1
+res_df$significant <- res_df$padj < 0.05 & abs(res_df$log2FoldChange) > 1
+
+png(file.path(outdir, "volcano.png"), width=800, height=600)
+ggplot(res_df, aes(x=log2FoldChange, y=-log10(padj), color=significant)) +
+  geom_point(alpha=0.5) + theme_minimal() + labs(x="log2FC (UV / Control)", y="-log10(adj p-value)")
+dev.off()
+
+# ---------------------------
+# 6. Pathway / GO enrichment
+# ---------------------------
+# Use clusterProfiler with Arabidopsis org and KEGG (ath)
+# Prepare gene list: use significant genes (padj < 0.05)
+sig_genes <- res_ordered %>% filter(!is.na(padj) & padj < 0.05) %>% pull(gene_id)
+
+# If your gene IDs are Ensembl IDs or TAIR IDs, ensure proper mapping to Entrez IDs if required by KEGG.
+# clusterProfiler supports KEGG with species = 'ath' and gene IDs as Entrez IDs — 
+# many Arabidopsis resources use TAIR (e.g., AT1G01010). Here we try g:Profiler via gprofiler2 for robust mapping.
+
+if(length(sig_genes) >= 5) {
+  gostres <- gost(query = sig_genes,
+                  organism = "athaliana",
+                  ordered_query = FALSE,
+                  significant = TRUE,
+                  correction_method = "fdr",
+                  sources = c("GO:BP","REAC","KEGG"))
+  # Save results
+  if(!is.null(gostres$result) && nrow(gostres$result) > 0) {
+    write_csv(gostres$result, file.path(outdir, "gprofiler_results.csv"))
+    # Top 5 enriched pathways (by p-value)
+    top5 <- gostres$result %>% arrange(p_value) %>% slice(1:5)
+    write_csv(top5, file.path(outdir, "top5_enriched_pathways.csv"))
+    print("Top 5 enriched pathways (g:Profiler):")
+    print(top5[,c("source","term_name","p_value","intersection_size")])
+  } else {
+    message("g:Profiler returned no enrichment results for the input gene list.")
+  }
+} else {
+  message("Less than 5 significant genes found — can't run pathway enrichment meaningfully.")
+}
+
+# Alternative: enrichGO using clusterProfiler (requires OrgDb mapping)
+# Example: map gene IDs to Entrez IDs if OrgDb supports it.
+# (Left as optional.)
